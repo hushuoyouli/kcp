@@ -553,21 +553,25 @@ impl<Output> Kcp<Output> {
         Ok(sent_size)
     }
 
+    /// RTT/RTO update (RFC 6298, same as kcp-go).
     fn update_ack(&mut self, rtt: u32) {
+        let rtt_i = rtt as i32;
         if self.rx_srtt == 0 {
             self.rx_srtt = rtt;
             self.rx_rttval = rtt / 2;
         } else {
-            let delta = if rtt > self.rx_srtt {
-                rtt - self.rx_srtt
+            let srtt_i = self.rx_srtt as i32;
+            let rttvar_i = self.rx_rttval as i32;
+            let delta = rtt_i - srtt_i;
+            let new_srtt = srtt_i + (delta >> 3);
+            let abs_delta = if delta < 0 { -delta } else { delta };
+            let new_rttvar = if rtt_i < new_srtt - rttvar_i {
+                rttvar_i + ((abs_delta - rttvar_i) >> 5)
             } else {
-                self.rx_srtt - rtt
+                rttvar_i + ((abs_delta - rttvar_i) >> 2)
             };
-            self.rx_rttval = (3 * self.rx_rttval + delta) / 4;
-            self.rx_srtt = (7 * self.rx_srtt + rtt) / 8;
-            if self.rx_srtt < 1 {
-                self.rx_srtt = 1;
-            }
+            self.rx_srtt = cmp::max(new_srtt, 1) as u32;
+            self.rx_rttval = cmp::max(new_rttvar, 0) as u32;
         }
         let rto = self.rx_srtt + cmp::max(self.interval, 4 * self.rx_rttval);
         self.rx_rto = bound(self.rx_minrto, rto, KCP_RTO_MAX);
@@ -707,7 +711,19 @@ impl<Output> Kcp<Output> {
     }
 
     /// Like `input`, with `ack_no_delay`: when true, request immediate ACK flush (Go parity).
+    #[inline]
     pub fn input_opt(&mut self, buf: &[u8], ack_no_delay: bool) -> KcpResult<usize> {
+        self.input_opt_full(buf, ack_no_delay, true)
+    }
+
+    /// Like `input_opt`, with `packet_regular`: when false (e.g. FEC-recovered), do not update
+    /// `rmt_wnd` or RTT (kcp-go `Input(data, pktType, ackNoDelay)` parity).
+    pub fn input_opt_full(
+        &mut self,
+        buf: &[u8],
+        ack_no_delay: bool,
+        packet_regular: bool,
+    ) -> KcpResult<usize> {
         let input_size = buf.len();
 
         trace!("[RI] {} bytes", buf.len());
@@ -769,7 +785,9 @@ impl<Output> Kcp<Output> {
                 }
             }
 
-            self.rmt_wnd = wnd;
+            if packet_regular {
+                self.rmt_wnd = wnd;
+            }
 
             if self.parse_una(una) > 0 {
                 flush_segments = true;
@@ -780,14 +798,8 @@ impl<Output> Kcp<Output> {
 
             match cmd {
                 KCP_CMD_ACK => {
-                    let rtt = timediff(self.current, ts);
-                    if rtt >= 0 {
-                        self.update_ack(rtt as u32);
-                    }
                     self.parse_ack(sn);
                     self.shrink_buf();
-                    // flush_segments from parse_fastack is applied after the loop
-
                     if !flag {
                         flag = true;
                         max_ack = sn;
@@ -862,6 +874,14 @@ impl<Output> Kcp<Output> {
         if flag {
             if self.parse_fastack(max_ack, latest_ts) {
                 flush_segments = true;
+            }
+        }
+
+        // Update RTT with the latest ACK ts (ignore FEC packet; same as kcp-go)
+        if flag && packet_regular {
+            let rtt = timediff(self.current, latest_ts);
+            if rtt >= 0 {
+                self.update_ack(rtt as u32);
             }
         }
 
