@@ -1,7 +1,6 @@
 //! KCP
 
 use std::cmp;
-use std::cmp::Ordering;
 use std::collections::VecDeque;
 use std::fmt::{self, Debug};
 use std::io::{self, Cursor, Read, Write};
@@ -76,7 +75,7 @@ fn timediff(later: u32, earlier: u32) -> i32 {
     later as i32 - earlier as i32
 }
 
-#[derive(Default, Clone, Debug)]
+#[derive(Clone, Debug)]
 struct KcpSegment {
     conv: u32,
     cmd: u8,
@@ -89,7 +88,29 @@ struct KcpSegment {
     rto: u32,
     fastack: u32,
     xmit: u32,
+    /// Marked when ACK received; removed when una advances (kcp-go lazy removal).
+    acked: bool,
     data: BytesMut,
+}
+
+impl Default for KcpSegment {
+    fn default() -> Self {
+        KcpSegment {
+            conv: 0,
+            cmd: 0,
+            frg: 0,
+            wnd: 0,
+            ts: 0,
+            sn: 0,
+            una: 0,
+            resendts: 0,
+            rto: 0,
+            fastack: 0,
+            xmit: 0,
+            acked: false,
+            data: BytesMut::new(),
+        }
+    }
 }
 
 impl KcpSegment {
@@ -106,6 +127,7 @@ impl KcpSegment {
             rto: 0,
             fastack: 0,
             xmit: 0,
+            acked: false,
             data,
         }
     }
@@ -585,20 +607,20 @@ impl<Output> Kcp<Output> {
         };
     }
 
+    /// Mark segment as ACKed and recycle data; actual removal when una advances (kcp-go parity).
     fn parse_ack(&mut self, sn: u32) {
         if timediff(sn, self.snd_una) < 0 || timediff(sn, self.snd_nxt) >= 0 {
             return;
         }
 
-        let mut i = 0 as usize;
-        while i < self.snd_buf.len() {
-            match sn.cmp(&self.snd_buf[i].sn) {
-                Ordering::Equal => {
-                    self.snd_buf.remove(i);
-                    break;
-                }
-                Ordering::Less => break,
-                _ => i = i + 1,
+        for seg in &mut self.snd_buf {
+            if sn == seg.sn {
+                seg.acked = true;
+                seg.data.clear();
+                break;
+            }
+            if timediff(sn, seg.sn) < 0 {
+                break;
             }
         }
     }
@@ -1281,6 +1303,9 @@ impl<Output: Write> Kcp<Output> {
         let mut change = 0;
 
         for snd_segment in &mut self.snd_buf {
+            if snd_segment.acked {
+                continue;
+            }
             let mut need_send = false;
 
             if snd_segment.xmit == 0 {
@@ -1533,6 +1558,9 @@ impl<Output: AsyncWrite + Unpin> Kcp<Output> {
         let mut change = 0;
 
         for snd_segment in &mut self.snd_buf {
+            if snd_segment.acked {
+                continue;
+            }
             let mut need_send = false;
 
             if snd_segment.xmit == 0 {
