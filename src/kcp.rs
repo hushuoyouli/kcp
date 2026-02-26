@@ -31,7 +31,7 @@ const KCP_ASK_SEND: u32 = 1; // need to send IKCP_CMD_WASK
 const KCP_ASK_TELL: u32 = 2; // need to send IKCP_CMD_WINS
 
 const KCP_WND_SND: u16 = 32;
-const KCP_WND_RCV: u16 = 128; // must >= max fragment size
+const KCP_WND_RCV: u16 = 32;
 
 const KCP_MTU_DEF: usize = 1400;
 // const KCP_ACK_FAST: u32 = 3;
@@ -44,9 +44,9 @@ const KCP_DEADLINK: u32 = 20;
 const KCP_THRESH_INIT: u16 = 2;
 const KCP_THRESH_MIN: u16 = 2;
 
-const KCP_PROBE_INIT: u32 = 7000; // 7 secs to probe window size
+const KCP_PROBE_INIT: u32 = 500; // 500ms to probe window size
 const KCP_PROBE_LIMIT: u32 = 120000; // up to 120 secs to probe window
-const KCP_FASTACK_LIMIT: u32 = 5; // max times to trigger fastack
+const KCP_FASTACK_LIMIT: u32 = 0; // 0 means unlimited fast retransmits
 
 /// Read `conv` from raw buffer
 pub fn get_conv(mut buf: &[u8]) -> u32 {
@@ -134,6 +134,13 @@ impl KcpSegment {
     fn encoded_len(&self) -> usize {
         KCP_OVERHEAD as usize + self.data.len()
     }
+}
+
+/// Requested flush after input (for low-latency parity with kcp-go).
+#[derive(Clone, Copy, Debug)]
+enum PendingFlush {
+    Full,
+    AckOnly,
 }
 
 #[derive(Default)]
@@ -271,6 +278,9 @@ pub struct Kcp<Output> {
     /// Get conv from the next input call
     input_conv: bool,
 
+    /// Flush to perform after input (Go-style immediate flush)
+    pending_flush: Option<PendingFlush>,
+
     output: KcpOutput<Output>,
 }
 
@@ -315,6 +325,7 @@ impl<Output> Debug for Kcp<Output> {
             .field("nocwnd", &self.nocwnd)
             .field("stream", &self.stream)
             .field("input_conv", &self.input_conv)
+            .field("pending_flush", &self.pending_flush)
             .finish()
     }
 }
@@ -383,6 +394,7 @@ impl<Output> Kcp<Output> {
             dead_link: KCP_DEADLINK,
 
             input_conv: false,
+            pending_flush: None,
             output: KcpOutput(output),
         }
     }
@@ -513,7 +525,7 @@ impl<Output> Kcp<Output> {
             (buf.len() + self.mss as usize - 1) / self.mss as usize
         };
 
-        if count >= KCP_WND_RCV as usize {
+        if count > u8::MAX as usize {
             debug!("send bufsize={} mss={} too large", buf.len(), self.mss);
             return Err(Error::UserBufTooBig);
         }
@@ -587,35 +599,47 @@ impl<Output> Kcp<Output> {
         }
     }
 
-    fn parse_una(&mut self, una: u32) {
+    /// Remove segments acknowledged by `una`. Returns number of segments removed.
+    fn parse_una(&mut self, una: u32) -> usize {
+        let mut count = 0;
         while let Some(seg) = self.snd_buf.front() {
             if timediff(una, seg.sn) > 0 {
                 self.snd_buf.pop_front();
+                count += 1;
             } else {
                 break;
             }
         }
+        count
     }
 
-    fn parse_fastack(&mut self, sn: u32, ts: u32) {
+    /// Update fastack counts; returns true if any segment reached fastresend (trigger flush).
+    fn parse_fastack(&mut self, sn: u32, ts: u32) -> bool {
         if timediff(sn, self.snd_una) < 0 || timediff(sn, self.snd_nxt) >= 0 {
-            return;
+            return false;
         }
 
+        let mut should_flush = false;
         for seg in &mut self.snd_buf {
             if timediff(sn, seg.sn) < 0 {
                 break;
             } else if sn != seg.sn {
-                #[cfg(feature = "fastack-conserve")]
-                {
-                    seg.fastack += 1;
-                }
-                #[cfg(not(feature = "fastack-conserve"))]
-                if timediff(ts, seg.ts) >= 0 {
-                    seg.fastack += 1;
+                if seg.fastack != u32::MAX {
+                    #[cfg(feature = "fastack-conserve")]
+                    {
+                        seg.fastack += 1;
+                    }
+                    #[cfg(not(feature = "fastack-conserve"))]
+                    if timediff(ts, seg.ts) >= 0 {
+                        seg.fastack += 1;
+                    }
+                    if seg.fastack >= self.fastresend {
+                        should_flush = true;
+                    }
                 }
             }
         }
+        should_flush
     }
 
     #[inline]
@@ -676,8 +700,14 @@ impl<Output> Kcp<Output> {
         self.conv
     }
 
-    /// Call this when you received a packet from raw connection
+    /// Call this when you received a packet from raw connection.
+    #[inline]
     pub fn input(&mut self, buf: &[u8]) -> KcpResult<usize> {
+        self.input_opt(buf, false)
+    }
+
+    /// Like `input`, with `ack_no_delay`: when true, request immediate ACK flush (Go parity).
+    pub fn input_opt(&mut self, buf: &[u8], ack_no_delay: bool) -> KcpResult<usize> {
         let input_size = buf.len();
 
         trace!("[RI] {} bytes", buf.len());
@@ -695,6 +725,7 @@ impl<Output> Kcp<Output> {
         let mut max_ack = 0;
         let old_una = self.snd_una;
         let mut latest_ts = 0;
+        let mut flush_segments = false;
 
         let mut buf = Cursor::new(buf);
         while buf.remaining() >= KCP_OVERHEAD as usize {
@@ -740,7 +771,9 @@ impl<Output> Kcp<Output> {
 
             self.rmt_wnd = wnd;
 
-            self.parse_una(una);
+            if self.parse_una(una) > 0 {
+                flush_segments = true;
+            }
             self.shrink_buf();
 
             let mut has_read_data = false;
@@ -753,6 +786,7 @@ impl<Output> Kcp<Output> {
                     }
                     self.parse_ack(sn);
                     self.shrink_buf();
+                    // flush_segments from parse_fastack is applied after the loop
 
                     if !flag {
                         flag = true;
@@ -826,10 +860,12 @@ impl<Output> Kcp<Output> {
         }
 
         if flag {
-            self.parse_fastack(max_ack, latest_ts);
+            if self.parse_fastack(max_ack, latest_ts) {
+                flush_segments = true;
+            }
         }
 
-        if timediff(self.snd_una, old_una) > 0 && self.cwnd < self.rmt_wnd {
+        if !self.nocwnd && timediff(self.snd_una, old_una) > 0 && self.cwnd < self.rmt_wnd {
             let mss = self.mss;
             if self.cwnd < self.ssthresh {
                 self.cwnd += 1;
@@ -849,6 +885,17 @@ impl<Output> Kcp<Output> {
                 self.incr = self.rmt_wnd as usize * mss;
             }
         }
+
+        // Go-style immediate flush decision (low-latency parity with kcp-go)
+        self.pending_flush = if flush_segments {
+            Some(PendingFlush::Full)
+        } else if self.acklist.len() >= self.mtu / KCP_OVERHEAD {
+            Some(PendingFlush::AckOnly)
+        } else if ack_no_delay && !self.acklist.is_empty() {
+            Some(PendingFlush::AckOnly)
+        } else {
+            None
+        };
 
         Ok(buf.position() as usize)
     }
@@ -1001,7 +1048,7 @@ impl<Output> Kcp<Output> {
         }
 
         if rcvwnd > 0 {
-            self.rcv_wnd = cmp::max(rcvwnd, KCP_WND_RCV) as u16;
+            self.rcv_wnd = rcvwnd as u16;
         }
     }
 
@@ -1074,20 +1121,41 @@ impl<Output> Kcp<Output> {
 
 impl<Output: Write> Kcp<Output> {
     fn _flush_ack(&mut self, segment: &mut KcpSegment) -> KcpResult<()> {
-        // flush acknowledges
-        // while let Some((sn, ts)) = self.acklist.pop_front() {
-        for &(sn, ts) in &self.acklist {
-            if self.buf.len() + KCP_OVERHEAD as usize > self.mtu as usize {
-                self.output.write_all(&self.buf)?;
-                self.buf.clear();
+        // flush acknowledges (filter jitters caused by bufferbloat, same as kcp-go)
+        let n = self.acklist.len();
+        for (i, &(sn, ts)) in self.acklist.iter().enumerate() {
+            if timediff(sn, self.rcv_nxt) >= 0 || i == n.wrapping_sub(1) {
+                if self.buf.len() + KCP_OVERHEAD as usize > self.mtu as usize {
+                    self.output.write_all(&self.buf)?;
+                    self.buf.clear();
+                }
+                segment.sn = sn;
+                segment.ts = ts;
+                segment.encode(&mut self.buf);
             }
-            segment.sn = sn;
-            segment.ts = ts;
-            segment.encode(&mut self.buf);
         }
         self.acklist.clear();
 
         Ok(())
+    }
+
+    /// Apply pending flush requested by the last `input` / `input_opt` (Go-style immediate flush).
+    pub fn apply_pending_flush(&mut self) -> KcpResult<()> {
+        if let Some(ft) = self.pending_flush.take() {
+            match ft {
+                PendingFlush::Full => self.flush()?,
+                PendingFlush::AckOnly => self.flush_ack()?,
+            }
+        }
+        Ok(())
+    }
+
+    /// Process raw packet and immediately apply any requested flush (parity with kcp-go `Input`).
+    #[inline]
+    pub fn input_with_flush(&mut self, buf: &[u8], ack_no_delay: bool) -> KcpResult<usize> {
+        let n = self.input_opt(buf, ack_no_delay)?;
+        self.apply_pending_flush()?;
+        Ok(n)
     }
 
     fn _flush_probe_commands(&mut self, cmd: u8, segment: &mut KcpSegment) -> KcpResult<()> {
@@ -1159,7 +1227,8 @@ impl<Output: Write> Kcp<Output> {
             cwnd = cmp::min(self.cwnd, cwnd);
         }
 
-        // move data from snd_queue to snd_buf
+        // move data from snd_queue to snd_buf (newSegsCount for early retransmit, same as kcp-go)
+        let mut new_segs_count = 0;
         while timediff(self.snd_nxt, self.snd_una + cwnd as u32) < 0 {
             match self.snd_queue.pop_front() {
                 Some(mut new_segment) => {
@@ -1175,6 +1244,7 @@ impl<Output: Write> Kcp<Output> {
                     new_segment.fastack = 0;
                     new_segment.xmit = 0;
                     self.snd_buf.push_back(new_segment);
+                    new_segs_count += 1;
                 }
                 None => break,
             }
@@ -1187,8 +1257,6 @@ impl<Output: Write> Kcp<Output> {
             u32::max_value()
         };
 
-        let rtomin = if !self.nodelay { self.rx_rto >> 3 } else { 0 };
-
         let mut lost = false;
         let mut change = 0;
 
@@ -1199,27 +1267,37 @@ impl<Output: Write> Kcp<Output> {
                 need_send = true;
                 snd_segment.xmit += 1;
                 snd_segment.rto = self.rx_rto;
-                snd_segment.resendts = self.current + snd_segment.rto + rtomin;
+                snd_segment.resendts = self.current + snd_segment.rto;
+            } else if snd_segment.fastack >= resent && snd_segment.fastack != u32::MAX {
+                need_send = true;
+                snd_segment.xmit += 1;
+                snd_segment.fastack = u32::MAX;
+                snd_segment.rto = self.rx_rto;
+                snd_segment.resendts = self.current + snd_segment.rto;
+                change += 1;
+            } else if snd_segment.fastack > 0
+                && snd_segment.fastack != u32::MAX
+                && new_segs_count == 0
+            {
+                // early retransmit (kcp-go: when no new segments this round)
+                need_send = true;
+                snd_segment.xmit += 1;
+                snd_segment.fastack = u32::MAX;
+                snd_segment.rto = self.rx_rto;
+                snd_segment.resendts = self.current + snd_segment.rto;
+                change += 1;
             } else if timediff(self.current, snd_segment.resendts) >= 0 {
                 need_send = true;
                 snd_segment.xmit += 1;
                 self.xmit += 1;
                 if !self.nodelay {
-                    snd_segment.rto += cmp::max(snd_segment.rto, self.rx_rto);
+                    snd_segment.rto += self.rx_rto;
                 } else {
-                    let step = snd_segment.rto; // (kcp->nodelay < 2) ? ((IINT32)(segment->rto)) : kcp->rx_rto;
-                    snd_segment.rto += step / 2;
+                    snd_segment.rto += self.rx_rto / 2;
                 }
+                snd_segment.fastack = 0;
                 snd_segment.resendts = self.current + snd_segment.rto;
                 lost = true;
-            } else if snd_segment.fastack >= resent {
-                if snd_segment.xmit <= self.fastlimit || self.fastlimit <= 0 {
-                    need_send = true;
-                    snd_segment.xmit += 1;
-                    snd_segment.fastack = 0;
-                    snd_segment.resendts = self.current + snd_segment.rto;
-                    change += 1;
-                }
             }
 
             if need_send {
@@ -1255,7 +1333,8 @@ impl<Output: Write> Kcp<Output> {
             if self.ssthresh < KCP_THRESH_MIN {
                 self.ssthresh = KCP_THRESH_MIN;
             }
-            self.cwnd = self.ssthresh + resent as u16;
+            let cwnd_candidate = (self.ssthresh as u32).saturating_add(resent).min(u16::MAX as u32) as u16;
+            self.cwnd = cmp::min(cwnd_candidate, cmp::min(self.snd_wnd, self.rmt_wnd));
             self.incr = self.cwnd as usize * self.mss;
         }
 
@@ -1400,7 +1479,8 @@ impl<Output: AsyncWrite + Unpin> Kcp<Output> {
             cwnd = cmp::min(self.cwnd, cwnd);
         }
 
-        // move data from snd_queue to snd_buf
+        // move data from snd_queue to snd_buf (newSegsCount for early retransmit, same as kcp-go)
+        let mut new_segs_count = 0;
         while timediff(self.snd_nxt, self.snd_una + cwnd as u32) < 0 {
             match self.snd_queue.pop_front() {
                 Some(mut new_segment) => {
@@ -1416,6 +1496,7 @@ impl<Output: AsyncWrite + Unpin> Kcp<Output> {
                     new_segment.fastack = 0;
                     new_segment.xmit = 0;
                     self.snd_buf.push_back(new_segment);
+                    new_segs_count += 1;
                 }
                 None => break,
             }
@@ -1428,8 +1509,6 @@ impl<Output: AsyncWrite + Unpin> Kcp<Output> {
             u32::max_value()
         };
 
-        let rtomin = if !self.nodelay { self.rx_rto >> 3 } else { 0 };
-
         let mut lost = false;
         let mut change = 0;
 
@@ -1440,27 +1519,37 @@ impl<Output: AsyncWrite + Unpin> Kcp<Output> {
                 need_send = true;
                 snd_segment.xmit += 1;
                 snd_segment.rto = self.rx_rto;
-                snd_segment.resendts = self.current + snd_segment.rto + rtomin;
+                snd_segment.resendts = self.current + snd_segment.rto;
+            } else if snd_segment.fastack >= resent && snd_segment.fastack != u32::MAX {
+                need_send = true;
+                snd_segment.xmit += 1;
+                snd_segment.fastack = u32::MAX;
+                snd_segment.rto = self.rx_rto;
+                snd_segment.resendts = self.current + snd_segment.rto;
+                change += 1;
+            } else if snd_segment.fastack > 0
+                && snd_segment.fastack != u32::MAX
+                && new_segs_count == 0
+            {
+                // early retransmit (kcp-go: when no new segments this round)
+                need_send = true;
+                snd_segment.xmit += 1;
+                snd_segment.fastack = u32::MAX;
+                snd_segment.rto = self.rx_rto;
+                snd_segment.resendts = self.current + snd_segment.rto;
+                change += 1;
             } else if timediff(self.current, snd_segment.resendts) >= 0 {
                 need_send = true;
                 snd_segment.xmit += 1;
                 self.xmit += 1;
                 if !self.nodelay {
-                    snd_segment.rto += cmp::max(snd_segment.rto, self.rx_rto);
+                    snd_segment.rto += self.rx_rto;
                 } else {
-                    let step = snd_segment.rto; // (kcp->nodelay < 2) ? ((IINT32)(segment->rto)) : kcp->rx_rto;
-                    snd_segment.rto += step / 2;
+                    snd_segment.rto += self.rx_rto / 2;
                 }
+                snd_segment.fastack = 0;
                 snd_segment.resendts = self.current + snd_segment.rto;
                 lost = true;
-            } else if snd_segment.fastack >= resent {
-                if snd_segment.xmit <= self.fastlimit || self.fastlimit <= 0 {
-                    need_send = true;
-                    snd_segment.xmit += 1;
-                    snd_segment.fastack = 0;
-                    snd_segment.resendts = self.current + snd_segment.rto;
-                    change += 1;
-                }
             }
 
             if need_send {
@@ -1496,7 +1585,8 @@ impl<Output: AsyncWrite + Unpin> Kcp<Output> {
             if self.ssthresh < KCP_THRESH_MIN {
                 self.ssthresh = KCP_THRESH_MIN;
             }
-            self.cwnd = self.ssthresh + resent as u16;
+            let cwnd_candidate = (self.ssthresh as u32).saturating_add(resent).min(u16::MAX as u32) as u16;
+            self.cwnd = cmp::min(cwnd_candidate, cmp::min(self.snd_wnd, self.rmt_wnd));
             self.incr = self.cwnd as usize * self.mss;
         }
 
