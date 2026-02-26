@@ -978,12 +978,12 @@ impl<Output> Kcp<Output> {
         }
     }
 
-    /// Determine when you should call `update`.
-    /// Return when you should invoke `update` in millisec, if there is no `input`/`send` calling.
-    /// You can call `update` in that time without calling it repeatly.
+    /// Determine when you should call `update` (kcp-go / C KCP semantics).
+    /// Returns the next timestamp (ms) at which to call `update()`, or `current` if update
+    /// should be called immediately. Use e.g. `if now >= kcp.check(now) { kcp.update(now) }`.
     pub fn check(&self, current: u32) -> u32 {
         if !self.updated {
-            return 0;
+            return current;
         }
 
         let mut ts_flush = self.ts_flush;
@@ -994,14 +994,17 @@ impl<Output> Kcp<Output> {
         }
 
         if timediff(current, ts_flush) >= 0 {
-            return 0;
+            return current;
         }
 
         let tm_flush = timediff(ts_flush, current) as u32;
         for seg in &self.snd_buf {
+            if seg.acked {
+                continue;
+            }
             let diff = timediff(seg.resendts, current);
             if diff <= 0 {
-                return 0;
+                return current;
             }
             if (diff as u32) < tm_packet {
                 tm_packet = diff as u32;
@@ -1013,7 +1016,7 @@ impl<Output> Kcp<Output> {
             minimal = self.interval;
         }
 
-        minimal
+        current + minimal
     }
 
     /// Change MTU size, default is 1400
