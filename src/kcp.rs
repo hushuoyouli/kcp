@@ -607,27 +607,6 @@ impl<Output> Kcp<Output> {
         };
     }
 
-    /// Reclaim excess VecDeque capacity when usage drops well below allocation.
-    /// Only triggers when capacity > threshold and len < capacity/4, to avoid
-    /// thrashing on normal fluctuations.
-    fn try_shrink_buffers(&mut self) {
-        const SHRINK_THRESHOLD: usize = 128;
-
-        #[inline]
-        fn maybe_shrink<T>(deque: &mut VecDeque<T>) {
-            let cap = deque.capacity();
-            if cap > SHRINK_THRESHOLD && deque.len() < cap / 4 {
-                deque.shrink_to(deque.len().max(SHRINK_THRESHOLD / 2));
-            }
-        }
-
-        maybe_shrink(&mut self.snd_buf);
-        maybe_shrink(&mut self.snd_queue);
-        maybe_shrink(&mut self.rcv_buf);
-        maybe_shrink(&mut self.rcv_queue);
-        maybe_shrink(&mut self.acklist);
-    }
-
     /// Mark segment as ACKed and recycle data; actual removal when una advances (kcp-go parity).
     fn parse_ack(&mut self, sn: u32) {
         if timediff(sn, self.snd_una) < 0 || timediff(sn, self.snd_nxt) >= 0 {
@@ -1421,8 +1400,6 @@ impl<Output: Write> Kcp<Output> {
             self.incr = self.mss;
         }
 
-        self.try_shrink_buffers();
-
         Ok(())
     }
 
@@ -1677,8 +1654,6 @@ impl<Output: AsyncWrite + Unpin> Kcp<Output> {
             self.cwnd = 1;
             self.incr = self.mss;
         }
-
-        self.try_shrink_buffers();
 
         Ok(())
     }
