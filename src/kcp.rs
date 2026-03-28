@@ -25,6 +25,10 @@ const KCP_CMD_PUSH: u8 = 81; // cmd: push data
 const KCP_CMD_ACK: u8 = 82; // cmd: ack
 const KCP_CMD_WASK: u8 = 83; // cmd: window probe (ask)
 const KCP_CMD_WINS: u8 = 84; // cmd: window size (tell)
+/// Reachability probe request (ping). Public so transport layers can inspect cmd bytes.
+pub const KCP_CMD_PROBE: u8 = 85;
+/// Reachability probe response (pong).
+pub const KCP_CMD_PROBE_ACK: u8 = 86;
 
 const KCP_ASK_SEND: u32 = 1; // need to send IKCP_CMD_WASK
 const KCP_ASK_TELL: u32 = 2; // need to send IKCP_CMD_WINS
@@ -304,6 +308,12 @@ pub struct Kcp<Output> {
     pending_flush: Option<PendingFlush>,
 
     output: KcpOutput<Output>,
+
+    /// Collected ts values from received CMD_PROBE_ACK (86) packets.
+    probe_responses: Vec<u32>,
+
+    /// Pending probe-ack responses to send (ts values from received CMD_PROBE requests).
+    pending_probe_acks: Vec<u32>,
 }
 
 impl<Output> Debug for Kcp<Output> {
@@ -418,6 +428,8 @@ impl<Output> Kcp<Output> {
             input_conv: false,
             pending_flush: None,
             output: KcpOutput(output),
+            probe_responses: Vec::new(),
+            pending_probe_acks: Vec::new(),
         }
     }
 
@@ -726,6 +738,11 @@ impl<Output> Kcp<Output> {
         self.conv
     }
 
+    /// Take all collected probe-ack ts values (from received CMD_PROBE_ACK packets).
+    pub fn take_probe_responses(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.probe_responses)
+    }
+
     /// Call this when you received a packet from raw connection.
     #[inline]
     pub fn input(&mut self, buf: &[u8]) -> KcpResult<usize> {
@@ -801,6 +818,18 @@ impl<Output> Kcp<Output> {
 
             match cmd {
                 KCP_CMD_PUSH | KCP_CMD_ACK | KCP_CMD_WASK | KCP_CMD_WINS => {}
+                KCP_CMD_PROBE => {
+                    self.pending_probe_acks.push(ts);
+                    let next = buf.position() + len as u64;
+                    buf.set_position(next);
+                    continue;
+                }
+                KCP_CMD_PROBE_ACK => {
+                    self.probe_responses.push(ts);
+                    let next = buf.position() + len as u64;
+                    buf.set_position(next);
+                    continue;
+                }
                 _ => {
                     debug!("input cmd={} unrecognized", cmd);
                     return Err(Error::UnsupportedCmd(cmd));
@@ -1165,6 +1194,16 @@ impl<Output> Kcp<Output> {
 }
 
 impl<Output: Write> Kcp<Output> {
+    /// Send a reachability probe (CMD_PROBE=85) through the output writer.
+    pub fn send_probe(&mut self) -> KcpResult<usize> {
+        let mut buf = [0u8; KCP_OVERHEAD];
+        (&mut buf[0..4]).put_u32_le(self.conv);
+        buf[4] = KCP_CMD_PROBE;
+        (&mut buf[8..12]).put_u32_le(self.current);
+        self.output.write_all(&buf)?;
+        Ok(KCP_OVERHEAD)
+    }
+
     fn _flush_ack(&mut self, segment: &mut KcpSegment) -> KcpResult<()> {
         // flush acknowledges (filter jitters caused by bufferbloat, same as kcp-go)
         let n = self.acklist.len();
@@ -1186,11 +1225,24 @@ impl<Output: Write> Kcp<Output> {
 
     /// Apply pending flush requested by the last `input` / `input_opt` (Go-style immediate flush).
     pub fn apply_pending_flush(&mut self) -> KcpResult<()> {
+        self.flush_pending_probe_acks()?;
         if let Some(ft) = self.pending_flush.take() {
             match ft {
                 PendingFlush::Full => self.flush()?,
                 PendingFlush::AckOnly => self.flush_ack()?,
             }
+        }
+        Ok(())
+    }
+
+    /// Flush any pending probe-ack responses (CMD_PROBE_ACK=86) queued by input.
+    fn flush_pending_probe_acks(&mut self) -> KcpResult<()> {
+        for ts in std::mem::take(&mut self.pending_probe_acks) {
+            let mut resp = [0u8; KCP_OVERHEAD];
+            (&mut resp[0..4]).put_u32_le(self.conv);
+            resp[4] = KCP_CMD_PROBE_ACK;
+            (&mut resp[8..12]).put_u32_le(ts);
+            self.output.write_all(&resp)?;
         }
         Ok(())
     }
