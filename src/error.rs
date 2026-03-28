@@ -30,6 +30,8 @@ pub enum Error {
     UserBufTooBig,
     #[error("user's recv buffer is too small")]
     UserBufTooSmall,
+    #[error("probe timeout")]
+    ProbeTimeout,
 }
 
 fn make_io_error<T>(kind: ErrorKind, msg: T) -> io::Error
@@ -53,6 +55,7 @@ impl From<Error> for io::Error {
             Error::UnsupportedCmd(..) => ErrorKind::Other,
             Error::UserBufTooBig => ErrorKind::Other,
             Error::UserBufTooSmall => ErrorKind::Other,
+            Error::ProbeTimeout => ErrorKind::TimedOut,
         };
 
         make_io_error(kind, err)
